@@ -1,0 +1,250 @@
+#!/bin/bash
+
+# Author: Geoff Adams <gadams@avernus.com>
+# Date: Dec 2018
+# Description: DHCP client hook to handle DHCPv6-PD
+#
+# Computes and sets delegated IPv6 prefixes for attached network interfaces
+# given the information provided by dhclient and the prefix delegation
+# configuration appearing in the appropriate PD_CONFIG_FILE.
+#
+# This script is executed as a shell script by dhclient. (The shebang line
+# is informative only.) VyOS doesn't have bc installed, nor does it have an
+# ipv6 netmask calculator tool available, and Bash can't handle 128-bit math.
+# So instead, this hook script does subnet mask calculations using string
+# manipulation. That means that it is limited to multiples of four bits for
+# the netmask. In the future, this work could be factored out into a Python
+# program to do the computations, which this script could call.
+
+PD_CONFIG_FILE="/var/lib/dhcp/dhclient_v6_${interface}.delegations"
+
+# Join an array of strings with a delimiter.
+function join_by { local IFS="$1"; shift; echo "$*"; }
+
+# Turns a normally-formatted (human-readable) IPv6 address such as
+# 1234:567:9fab:1:: and turns it into the pure hex representation,
+# such as 123405679fab00010000000000000000. The latter format is
+# useful for doing bit manipulations on.
+dehumanize_ipv6_addr() {
+    IFS=':' read -ra words <<< "$(echo "$1" | sed 's/::/:*:/')"
+    # We'll need to replace any '*', if it exists, with enough '0000'
+    # words to make the whole thing 32 characters long. If the '*' is
+    # in the array, then we need one more '0000' word than 8 - len(words).
+    local zeros=$(eval $(echo printf '"0%0.s"' {1..$((36 - 4 * ${#words[@]}))}))
+    local new_words=()
+    for w in "${words[@]}"; do
+        if [ "$w" = "*" ]; then
+            w="$zeros"
+        else
+            w=$(echo "0000$w" | sed 's/.*\(....\)/\1/')
+        fi
+        new_words+=($w)
+    done
+    join_by '' "${new_words[@]}"
+}
+
+# Reverses the operation in debumanize_ipv6_addr. Inserts a : character
+# every four characters, removes leading zeroes in each word, and then
+# collapses ia run of 0s to a '::'. Only handles addresses, not addresses
+# plus prefixlengths.
+humanize_ipv6_addr() {
+    sed -e '# First, split into four-nibble words' \
+        -e ':loop1' \
+        -e 's/\([0-9a-z]\{4\}\)\([^:]\)/\1:\2/' \
+        -e 't loop1' \
+        -e '# Next, remove leading 0s in words' \
+        -e ':loop2' \
+        -e 's/:0\([^:]\)/:\1/g' \
+        -e 't loop2' \
+        -e '# Collapse runs of 0s to a single double colon' \
+        -e 's/:0:/::/' \
+        -e ':loop3' \
+        -e 's/::0:/::/' \
+        -e 't loop3' \
+        -e 's/::0/::/' \
+        -e '# Finally, strip the leading :, which we prepend' \
+        -e 's/^:\([^:]\)/\1/' <<< ":$1"
+}
+
+# Writes the computed interface address to stdout.
+# Args:
+#   $1: The delegated IPv6 prefix, including the slash and prefix length.
+#   $2: The site-level aggregation identifier; this is the subnet number
+#       within the delegated prefix. It's in decimal. TODO(gadams): Make hex.
+#   $3: The iid (the host part of the address), such as "::1".
+#   $4: The netmask length for the computed address; if not specified, it
+#       will be assumed to be 64.
+#
+# Writes nothing and logs an error if the given prefix doesn't leave enough
+# room for the sla id and the iid.
+#
+# All prefix lengths must be mutiples of 4, because 128-bit math in
+# shell scripting is hard.
+calc_ip6addr() {
+    [ -z "$1" ] && return
+    local ia_pd_addr
+
+    local sla_id=$(printf '%x\n' $2)
+    local prefix_net=$(dehumanize_ipv6_addr $(sed 's#/.*##' <<< $1))
+    local prefix_len=$(sed 's#.*/##' <<< $1)
+    local iid=$(dehumanize_ipv6_addr $3)
+    local result_netmask="$4"
+    [[ -n "$reault_netmask" ]] || result_netmask=64
+
+    local sla_bits_needed=$((${#sla_id} * 4)) # not exactly right
+    local sla_bits_avail=$((result_netmask - prefix_len))
+    if [ "$sla_bits_avail" -lt "$sla_bits_needed" -a "$sla_id" -ne 0 ]; then
+        logger -t "dhcpv6-pd" -p daemon.err "Error: Fewer than 64 bits remain for the host part of the address with delegated prefix $1 and sla_id $sla_id"
+        return
+    fi
+    logger -t "dhcpv6-pd" -p daemon.debug "Debug: $sla_bits_avail bits are available for the sla part of the address with delegated prefix $1 and sla_id $sla_id"
+
+    # Truncate the prefix_net to prefix_len bits
+    prefix_net=$(cut -c1-$((prefix_len / 4)) <<< $prefix_net)
+        
+    # Pad the sla_id if necessary to fill out sla_bits_avail bits
+    while [ ${#sla_id} -lt $((sla_bits_avail / 4)) ]; do
+        sla_id="0$sla_id"
+    done
+
+    # Collect the right number of bits for the iid
+    iid=$(cut -c$((result_netmask / 4 + 1))- <<< $iid)
+
+    echo $(humanize_ipv6_addr "$prefix_net$sla_id$iid")"/$result_netmask"
+}
+
+# Remove global addressed from an interface.
+# TODO(gadams): Should only remove addresses within the given prefix.
+# Args:
+#   $1: The interface name.
+#   $2: The prefix being removed (for log messages only).
+remove_prefix() {
+    [ -z "$1" -o -z "$2" ] && return
+    local iface="$1"
+    [ "$IA_PD_DEBUG" = "yes" ] && logger -t "dhcpv6-pd" -p daemon.debug "Debug: Old prefix $2 expired."
+    if [ "$(ip -6 addr show dev "$iface" scope global | wc -l)" -gt 0 ]; then
+        echo "Flushing global IPv6 addresses from $1; old prefix was $2"
+        logger -t "dhcpv6-pd" -p daemon.info "Info: Flushing global IPv6 addresses from interface $1."
+        if ! ip -6 addr flush dev "$1" scope global ; then
+            logger -t "dhcpv6-pd" -p daemon.err "Error: Failed to flush global IPv6 addresses from interface $1."
+            return
+        fi
+    elif [ "$IA_PD_DEBUG" = "yes" ]; then
+        logger -t "dhcpv6-pd" -p daemon.debug "Debug: No global IPv6 addresses assigned to interface $1."
+    fi 
+}
+
+# Assign an address to an interface.
+# Args:
+#   $1: The interface name.
+#   $2: The address to assign.
+assign_address() {
+    [ -z "$1" -o -z "$2" ] && return
+    local iface="$1"
+    local new_ia_pd_addr="$2"
+    [ "$IA_PD_DEBUG" = "yes" ] && logger -t "dhcpv6-pd" -p daemon.debug "Debug: Received new prefix $1."
+    echo "About to assign $new_ia_pd_addr to $iface"
+    # dhclient may return an old_ip6_prefix even after a reboot, so manually check if the address is already assigned to the interface
+    if [ "$(ip -6 addr show dev "$iface" | grep -c "$new_ia_pd_addr")" -lt 1 ]; then
+        # Clean up any old addresses, in case it was just the configuration
+        # that changed.
+        remove_prefix "$iface" "$new_ia_pd_addr"
+        logger -t "dhcpv6-pd" -p daemon.info "Info: Adding new address $new_ia_pd_addr to interface $iface."
+        if ! ip -6 addr add "$new_ia_pd_addr" dev "$iface" ; then
+            logger -t "dhcpv6-pd" -p daemon.err "Error: Failed to add new address $new_ia_pd_addr to interface $iface."
+            return
+        fi
+    elif [ "$IA_PD_DEBUG" = "yes" ]; then
+        logger -t "dhcpv6-pd" -p daemon.debug "Debug: Address $new_ia_pd_addr already assigned to interface $iface."
+    fi 
+}
+
+# Takes a line from the config file and updates the interface accordingly.
+# Globals:
+#   $old_ip6_prefix: Provided by dhclient
+#   $new_ip6_prefix: Provided by dhclient
+# Args:
+#   $1: A line from the config file.
+#
+# Lines in the config file are in this format:
+#
+#    interface [/ sla_id [/ prefix_len [/ iid]]]
+#
+# The interface may be any interface other than the one that the prefix
+# was requested on.
+# sla_id defaults to the OS interface index.
+# prefix_len defaults to 64.
+# iid (the interface identifier) defaults to ::1
+update_iface() {
+    IFS='/' read -ra parts <<< "$1"
+    local iface=${parts[0]}
+    local sla_id=${parts[1]}
+    local prefix_len=${parts[2]}
+    local iid=${parts[3]}
+
+    if [ -z "$iface" ]; then
+        logger -t "dhcpv6-pd" -p daemon.err "Error: Interface not specified!"
+        return
+    fi
+
+    # Check if interface exits; wait a short time if not
+    local n=0
+    until [ -e "/sys/class/net/$iface" -o $n -ge 10 ]; do
+        n=$[$n+1]
+        sleep 1
+    done
+    if [ ! -e "/sys/class/net/$iface" ]; then
+        logger -t "dhcpv6-pd" -p daemon.err "Error: Interface $iface not found. Cannot assign delegated prefix!"
+        return
+    fi
+    [ $n -gt 0 ] && logger -t "dhcpv6-pd" -p daemon.info "Info: Waited $n seconds for $iface to be set up"
+
+    [ -n "$sla_id" ] || sla_id="$(</sys/class/net/$iface/ifindex)"
+
+    [ -n "$prefix_len" ] || prefix_len=64
+
+    [ -n "$iid" ] || iid="::1"
+
+    # Remove old prefix if it differs from new prefix
+    [ -n "$old_ip6_prefix" ] && [ "$old_ip6_prefix" != "$new_ip6_prefix" ] && remove_prefix "$iface" "$old_ip6_prefix"
+    # TODO(gadams): We should also remove the old address if the delegation
+    # configuration has changed in any way, but maybe that's harder to detect.
+    # Assign new prefix
+    local new_ia_pd_addr="$(calc_ip6addr "$new_ip6_prefix" "$sla_id" "$iid" "$prefix_len")"
+    echo "New addr:" $new_ia_pd_addr
+    if [ -z "$new_ia_pd_addr" ]; then
+        logger -t "dhcpv6-pd" -p daemon.err "Error: Failed to calculate address for interface $iface and prefix $new_ip6_prefix"
+        return
+    fi
+    [ -n "$new_ip6_prefix" ] && assign_address "$iface" "$new_ia_pd_addr"
+}
+
+# Reads lines from the named config file, and calls update_iface for each one.
+# Args:
+#   $1: The config file path
+update_ifaces() {
+    while read -r line; do
+        line=$(sed 's/#.*//' <<< $line)
+        if [ -n "$line" ]; then
+            update_iface "$line"
+        fi
+    done < "$1"
+}
+
+printenv
+echo "=== Reason: $reason ==="
+
+# Only execute on specific occasions
+case $reason in
+    BOUND6|EXPIRE6|REBIND6|REBOOT6|RENEW6|STOP6)
+        # Only execute if either an old or a new prefix is defined
+        if [ -n "$old_ip6_prefix" ] || [ -n "$new_ip6_prefix" ]; then
+            update_ifaces "$PD_CONFIG_FILE"
+            # Other variables we might be able to make use of:
+            # new_dhcp6_name_servers ?
+            # new_preferred_life ?
+            # Rather than set any prefix lifetime on the interfaces, we
+            # rely on dhclient to revoke our lease through STOP6.
+        fi
+        ;;
+esac

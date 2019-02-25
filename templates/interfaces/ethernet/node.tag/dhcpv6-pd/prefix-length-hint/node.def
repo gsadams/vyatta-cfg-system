@@ -1,0 +1,4 @@
+type: u32
+help: Delegated prefix length to request from the DHCPv6 server
+syntax:expression: $VAR(@) >= 0 && $VAR(@) <= 128; "prefix length must be between 0 and 128"
+val_help: u32:0-128; Prefix length

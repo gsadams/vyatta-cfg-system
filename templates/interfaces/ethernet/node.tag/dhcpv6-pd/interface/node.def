@@ -1,0 +1,10 @@
+tag:
+type: txt
+help: Interface name
+# Seems like the interfaces aren't actually ready at boot when we get here.
+#commit:expression: exec " \
+#        if [ -z \"`ip addr | grep $VAR(@) `\" ]; then \
+#          echo interface $VAR(@) doesn\\'t exist on this system ; \
+#          exit 1 ; \
+#        fi ; "
+allowed: ${vyatta_sbindir}/vyatta-interfaces.pl --show all

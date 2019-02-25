@@ -1,0 +1,4 @@
+type: u32
+help: Site-Local Aggregator; the subnet number within the delegated prefix (Top-Level Aggregator)
+#syntax:expression: $VAR(@) > 0 && $VAR(@) <= 9999; "prefix delegation number must be between 1 and 9999"
+#val_help: u32:1-9999; Prefix delegation number

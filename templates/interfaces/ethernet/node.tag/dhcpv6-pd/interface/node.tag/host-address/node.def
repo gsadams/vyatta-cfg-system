@@ -1,0 +1,2 @@
+type: ipv6
+help: The host part of the IPv6 address to assign to this interface; defaults to ::1

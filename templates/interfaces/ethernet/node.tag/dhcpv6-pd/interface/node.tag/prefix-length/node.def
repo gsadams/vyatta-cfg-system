@@ -1,0 +1,4 @@
+type: u32
+help: Prefix length to assign to this interface; defaults to 64
+syntax:expression: $VAR(@) > 0 && $VAR(@) <= 128; "prefix length must be between 1 and 128"
+val_help: u32:1-128; Prefix length

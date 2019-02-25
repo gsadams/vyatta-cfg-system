@@ -33,6 +33,13 @@ use Vyatta::Config;
 use Vyatta::Interface;
 use Getopt::Long;
 
+# This script is executed in some cases in config mode, and in some cases
+# in operational mode. There is some shared work to be done, but it can
+# lead to some confusion, to it would probably be better to split it apart
+# into two scripts at some point.
+
+# get_conf_file must only be called in config mode. It uses config subsystem
+# to get the working config to generate the new active config.
 sub gen_conf_file {
     my ($conffile, $ifname) = @_;
     my $FD_WR;
@@ -53,11 +60,11 @@ sub gen_conf_file {
     my $intf = new Vyatta::Interface($ifname)
         or die "Can't find interface $ifname\n";
     my $level = $intf->path() . ' dhcpv6-options';
-   
+
     my $config = new Vyatta::Config;
     $config->setLevel($level);
 
-    if ($config->exists('duid')) { 
+    if ($config->exists('duid')) {
         my $duid = $config->returnValue('duid');
         print $FD_WR "        send dhcp6.client-id $duid;\n";
     }
@@ -67,7 +74,7 @@ sub gen_conf_file {
     print $FD_WR "}\n";
     close $FD_WR;
 }
-    
+
 sub usage {
     print "Usage: $0 --ifname=ethX --{start|stop|renew|release}\n";
     exit 1;
@@ -85,6 +92,9 @@ my $renew_flag;  # Re-start the daemon.  Functionally same as start_flag
 my $ifname;
 my $temporary;
 my $params_only;
+my $prefix_delegation;
+my $prefix_len_hint;
+my $also_ia_na;
 
 GetOptions("start" => \$start_flag,
            "stop" => \$stop_flag,
@@ -92,7 +102,10 @@ GetOptions("start" => \$start_flag,
            "renew" => \$renew_flag,
            "ifname=s" => \$ifname,
            "temporary" => \$temporary,
-           "parameters-only" => \$params_only
+           "parameters-only" => \$params_only,
+           "prefix-delegation" => \$prefix_delegation,
+           "prefix-len-hint=i" => \$prefix_len_hint,
+           "also-ia-na" => \$also_ia_na
     ) or usage();
 
 die "Error: Interface name must be specified with --ifname parameter.\n"
@@ -116,32 +129,50 @@ if ($renew_flag) {
         unless (-e $conffile);
 }
 
-if (defined($stop_flag) || defined ($release_flag)) {
-    # Stop dhclient -6 on $ifname
+# First, kill any previous instance of dhclient running on this interface
+printf("Stopping daemon...\n");
+system("$cmdname -6 -pf $pidfile -x $ifname");
 
-    printf("Stopping daemon...\n");
-    system("$cmdname -6 -cf $conffile -pf $pidfile -lf $leasefile -x $ifname");
-    
-    # Delete files it leaves behind...
-    printf("Deleting related files...\n");
-    unlink($pidfile);
-    if (defined $stop_flag) {
-        # If just releasing, leave the config file around as a flag that
-        # DHCPv6 remains configured on this interface.
-        unlink($conffile);
+# Clean up no-longer needed files.
+printf("Deleting related files...\n");
+unlink($pidfile);
+if (defined $stop_flag) {
+    # If just releasing, leave the config file around as a flag that
+    # DHCPv6 remains configured on this interface.
+    unlink($conffile);
+}
+
+if (defined($stop_flag) || defined($release_flag) || defined($renew_flag)) {
+    # In some instances, explicitly releasing a prior lease will help. For
+    # instance, some cable modems will not respond to a DHCPv6 Rebind if they
+    # have been rebooted recently, and without releasing the lease first,
+    # dhclient will only send Rebind requests until the lease is up.
+    printf("Releasing any existing lease...\n");
+    system("$cmdname -6 -r -cf $conffile -lf $leasefile $ifname");
+}
+
+# The start flag will be used in configuration mode, so we should
+# generate the DHCP client config file...
+if (defined($start_flag)) {
+    gen_conf_file($conffile, $ifname);
+}
+
+# Renew will be invoked in operational mode, but without access to the
+# DHCPv6 configuration of the interface, so we need to figure that out.
+if (defined ($renew_flag)) {
+    my $intf = new Vyatta::Interface($ifname)
+        or die "Can't find interface $ifname\n";
+
+    my $config = new Vyatta::Config;
+    $config->setLevel($intf->path());
+    if ($config->existsOrig('dhcpv6-pd')) {
+        $prefix_delegation='yes';
     }
+    # TODO(gadams): Also look for prefixlen_hint, parameters_only, also_ia_na,
+    # and temporary.
 }
 
 if (defined($start_flag) || defined ($renew_flag)) {
-
-    # Generate the DHCP client config file...
-    gen_conf_file($conffile, $ifname);
-
-    # First, kill any previous instance of dhclient running on this interface
-    #
-    printf("Stopping old daemon...\n");
-    system("$cmdname -6 -pf $pidfile -x $ifname");
-
     # Wait for IPv6 duplicate address detection to finish, dhclient won't start otherwise
     # https://phabricator.vyos.net/T903
     for (my $attempt_count = 0; $attempt_count <= 60; $attempt_count++) {
@@ -171,10 +202,18 @@ if (defined($start_flag) || defined ($renew_flag)) {
         exit 1;
     }
 
+    if (defined($prefix_delegation) && defined($params_only)) {
+        print "Error: prefix-delegation and parameters-only options are mutually exclusive!\n";
+        exit 1;
+    }
+
     my $temp_opt = defined($temporary) ? "-T" : "";
     my $po_opt = defined($params_only) ? "-S" : "";
+    my $pd_opt = defined($prefix_delegation) ? "-P" : "";
+    my $plen_hint_opt = defined($prefix_len_hint) ? "--prefix-len-hint $prefix_len_hint" : "";
+    my $also_ia_na_opt = defined($also_ia_na) ? "-N" : "";
 
     printf("Starting new daemon...\n");
-    exec "$cmdname -6 $temp_opt $po_opt -nw -cf $conffile -pf $pidfile -lf $leasefile $ifname"
+    exec "$cmdname -6 $temp_opt $po_opt $pd_opt $plen_hint_opt $also_ia_na_opt -nw -cf $conffile -pf $pidfile -lf $leasefile $ifname"
         or die "Can't exec $cmdname";
 }

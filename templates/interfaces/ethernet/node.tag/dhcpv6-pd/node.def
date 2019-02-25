@@ -1,0 +1,7 @@
+help: DHCPv6 Prefix Delegation
+
+end:
+    ifname="$VAR(../@)"
+    echo "dhcpv6-pd: ifname is $ifname"
+
+    sudo /usr/libexec/vyos/conf_mode/dhcpv6_client.py ethernet $ifname
